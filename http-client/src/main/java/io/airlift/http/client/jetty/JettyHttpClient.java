@@ -55,6 +55,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -161,12 +162,13 @@ public class JettyHttpClient
             throws E
     {
         long requestStart = System.nanoTime();
+        AtomicLong requestSizeInBytes = new AtomicLong();
 
         // apply filters
         request = applyRequestFilters(request);
 
         // create jetty request and response listener
-        HttpRequest jettyRequest = buildJettyRequest(request);
+        HttpRequest jettyRequest = buildJettyRequest(request, requestSizeInBytes);
         InputStreamResponseListener listener = new InputStreamResponseListener(maxContentLength)
         {
             @Override
@@ -215,7 +217,7 @@ public class JettyHttpClient
             value = responseHandler.handle(request, jettyResponse);
         }
         finally {
-            recordRequestComplete(stats, request, requestStart, jettyResponse, responseStart);
+            recordRequestComplete(stats, request, requestStart, requestSizeInBytes.get(), jettyResponse, responseStart);
         }
         return value;
     }
@@ -228,9 +230,10 @@ public class JettyHttpClient
 
         request = applyRequestFilters(request);
 
-        HttpRequest jettyRequest = buildJettyRequest(request);
+        AtomicLong requestSizeInBytes = new AtomicLong();
+        HttpRequest jettyRequest = buildJettyRequest(request, requestSizeInBytes);
 
-        final JettyResponseFuture<T, E> future = new JettyResponseFuture<>(request, jettyRequest, responseHandler, stats);
+        final JettyResponseFuture<T, E> future = new JettyResponseFuture<>(request, jettyRequest, responseHandler, requestSizeInBytes, stats);
 
         BufferingResponseListener listener = new BufferingResponseListener(Ints.checkedCast(new DataSize(10, Unit.MEGABYTE).toBytes()))
         {
@@ -265,7 +268,7 @@ public class JettyHttpClient
         return request;
     }
 
-    private HttpRequest buildJettyRequest(Request finalRequest)
+    private HttpRequest buildJettyRequest(Request finalRequest, AtomicLong requestSizeInBytes)
     {
         HttpRequest jettyRequest = (HttpRequest) httpClient.newRequest(finalRequest.getUri());
 
@@ -276,6 +279,7 @@ public class JettyHttpClient
         jettyRequest.method(finalRequest.getMethod());
 
         for (Entry<String, String> entry : finalRequest.getHeaders().entries()) {
+            requestSizeInBytes.addAndGet(entry.getKey().length() + 1 +  entry.getValue().length());
             jettyRequest.header(entry.getKey(), entry.getValue());
         }
 
@@ -283,10 +287,11 @@ public class JettyHttpClient
         if (bodyGenerator != null) {
             if (bodyGenerator instanceof StaticBodyGenerator) {
                 StaticBodyGenerator staticBodyGenerator = (StaticBodyGenerator) bodyGenerator;
+                requestSizeInBytes.addAndGet(staticBodyGenerator.getBody().length);
                 jettyRequest.content(new BytesContentProvider(staticBodyGenerator.getBody()));
             }
             else {
-                jettyRequest.content(new BodyGeneratorContentProvider(bodyGenerator, httpClient.getExecutor()));
+                jettyRequest.content(new BodyGeneratorContentProvider(bodyGenerator, httpClient.getExecutor(), requestSizeInBytes));
             }
         }
         return jettyRequest;
@@ -403,14 +408,16 @@ public class JettyHttpClient
         private final Request request;
         private final org.eclipse.jetty.client.api.Request jettyRequest;
         private final ResponseHandler<T, E> responseHandler;
+        private final AtomicLong requestSizeInBytes;
         private final RequestStats stats;
 
 
-        public JettyResponseFuture(Request request, org.eclipse.jetty.client.api.Request jettyRequest, ResponseHandler<T, E> responseHandler, RequestStats stats)
+        public JettyResponseFuture(Request request, org.eclipse.jetty.client.api.Request jettyRequest, ResponseHandler<T, E> responseHandler, AtomicLong requestSizeInBytes, RequestStats stats)
         {
             this.request = request;
             this.jettyRequest = jettyRequest;
             this.responseHandler = responseHandler;
+            this.requestSizeInBytes = requestSizeInBytes;
             this.stats = stats;
         }
 
@@ -461,7 +468,7 @@ public class JettyHttpClient
                 value = responseHandler.handle(request, jettyResponse);
             }
             finally {
-                recordRequestComplete(stats, request, requestStart, jettyResponse, responseStart);
+                recordRequestComplete(stats, request, requestStart, requestSizeInBytes.get(), jettyResponse, responseStart);
             }
             return value;
         }
@@ -518,7 +525,7 @@ public class JettyHttpClient
         }
     }
 
-    private static void recordRequestComplete(RequestStats requestStats, Request request, long requestStart, JettyResponse response, long responseStart)
+    private static void recordRequestComplete(RequestStats requestStats, Request request, long requestStart, long requestSizeInBytes, JettyResponse response, long responseStart)
     {
         if (response == null) {
             return;
@@ -529,7 +536,7 @@ public class JettyHttpClient
 
         requestStats.record(request.getMethod(),
                 response.getStatusCode(),
-                response.getBytesRead(),
+                requestSizeInBytes,
                 response.getBytesRead(),
                 requestProcessingTime,
                 responseProcessingTime);
@@ -543,11 +550,13 @@ public class JettyHttpClient
 
         private final BodyGenerator bodyGenerator;
         private final Executor executor;
+        private final AtomicLong requestSizeInBytes;
 
-        public BodyGeneratorContentProvider(BodyGenerator bodyGenerator, Executor executor)
+        public BodyGeneratorContentProvider(BodyGenerator bodyGenerator, Executor executor, AtomicLong requestSizeInBytes)
         {
             this.bodyGenerator = bodyGenerator;
             this.executor = executor;
+            this.requestSizeInBytes = requestSizeInBytes;
         }
 
         @Override
@@ -619,6 +628,7 @@ public class JettyHttpClient
                     throws IOException
             {
                 try {
+                    requestSizeInBytes.incrementAndGet();
                     // must copy array since it could be reused
                     chunks.put(ByteBuffer.wrap(new byte[]{(byte) b}));
                 }
@@ -632,6 +642,7 @@ public class JettyHttpClient
                     throws IOException
             {
                 try {
+                    requestSizeInBytes.addAndGet(len);
                     // must copy array since it could be reused
                     byte[] copy = Arrays.copyOfRange(b, off, len);
                     chunks.put(ByteBuffer.wrap(copy));
